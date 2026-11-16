@@ -1,0 +1,41 @@
+#!/bin/sh
+# pre-commit: refuses staged paths that must never be committed, then scans the
+# staged changes for secrets with gitleaks (PLAN section 10).
+
+hooks_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd) || exit 1
+
+list=$(mktemp) || exit 1
+trap 'rm -f "$list"' EXIT
+trap 'exit 1' HUP INT TERM
+
+# 1. Paths. -z lists every name exactly as it is, so names with non-ASCII
+#    letters, quotes or spaces are checked too. Deletions are left out, so a
+#    file committed by mistake can be removed.
+if ! git diff --cached --name-only --no-renames --diff-filter=d -z >"$list"; then
+  echo "pre-commit: could not list the staged files." >&2
+  exit 1
+fi
+if ! bad=$(tr '\000' '\n' <"$list" | awk -f "$hooks_dir/never-commit.awk"); then
+  echo "pre-commit: could not check the staged paths." >&2
+  exit 1
+fi
+if [ -n "$bad" ]; then
+  {
+    echo "pre-commit: these staged paths must never be committed:"
+    printf '%s\n' "$bad" | sed 's/^/  /'
+    echo "They match the never-commit groups in .gitignore: private/, secrets/, .env files, key files, *.local.*"
+    echo "Unstage each one with: git rm --cached -- <path>"
+  } >&2
+  exit 1
+fi
+
+# 2. Secrets in the staged changes.
+if command -v gitleaks >/dev/null 2>&1; then
+  if ! gitleaks git --pre-commit --staged --redact --no-banner --verbose; then
+    echo "pre-commit: gitleaks reported a possible secret in the staged changes, or could not run. Nothing was committed." >&2
+    exit 1
+  fi
+else
+  echo "pre-commit: warning: gitleaks is not installed, so the staged changes were not scanned for secrets." >&2
+fi
+exit 0

@@ -1,0 +1,35 @@
+# Secrets and local environment (never commit)
+.env
+*.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key
+id_rsa*
+id_ecdsa*
+id_ed25519*
+
+# Private notes (never commit; see private/README.md)
+# *.local.* also covers .claude/settings.local.json and CLAUDE.local.md.
+private/
+*.local.*
+
+# Data and backups
+data/
+backups/
+*.dump
+
+# Node
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+npm-debug.log*
+
+# OS and editor
+.DS_Store
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/

@@ -1,0 +1,1 @@
+# Decisions  Decision records, one file per decision: `NNNN-short-name.md`, numbered in order. Each one summarizes; the design docs own the details, and the open decisions are in `docs/PLAN.md` section 11.

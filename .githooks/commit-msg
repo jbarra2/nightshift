@@ -1,0 +1,23 @@
+#!/bin/sh
+# commit-msg: refuses AI attribution in a commit message (PLAN section 10).
+# pre-push runs this same file on every outgoing commit; CI will repeat it.
+# git runs it as: commit-msg <message-file>
+
+msg=${1-}
+pattern='^(co-authored-by:.*(claude|anthropic)|claude-session:|.*generated with \[?claude code)|claude\.ai/code/session'
+
+grep -qiE -- "$pattern" "$msg"
+found=$?
+case $found in
+  0)
+    echo "commit-msg: the message carries AI attribution (an attribution trailer, line or session link; see the pattern in .githooks/commit-msg). Commits in this repo carry none: remove it and commit again." >&2
+    exit 1
+    ;;
+  1)
+    exit 0
+    ;;
+  *)
+    echo "commit-msg: could not read or check the message file '$msg' (grep exit $found)." >&2
+    exit 1
+    ;;
+esac

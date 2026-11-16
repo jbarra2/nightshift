@@ -1,0 +1,156 @@
+#!/bin/sh
+# pre-push: checks everything that is about to leave this machine (PLAN section 10).
+#
+# A push to this public repo is published at once. So for every ref pushed, on
+# any branch, each outgoing commit must:
+#   - add no path that must never be committed (never-commit.awk);
+#   - carry no AI attribution in its message (commit-msg);
+#   - pass a gitleaks scan, when gitleaks is installed.
+# A push to main must also have a good signature (%G? = G) on every first-parent
+# commit after the commit in .githooks/signed-baseline. Until signing is set up,
+# that file is empty and this check only warns.
+#
+# git runs it as: pre-push <remote> <url>, with one line per ref on stdin:
+#   <local-ref> <local-sha> <remote-ref> <remote-sha>
+
+hooks_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd) || exit 1
+top=$(git rev-parse --show-toplevel) || exit 1
+baseline_file="$top/.githooks/signed-baseline"
+
+tmp=$(mktemp -d) || exit 1
+trap 'rm -rf "$tmp"' EXIT
+trap 'exit 1' HUP INT TERM
+
+status=0
+refuse() {
+  echo "pre-push: $*" >&2
+  status=1
+}
+is_zero() {
+  case $1 in
+    *[!0]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+is_hex() {
+  case $1 in
+    '' | *[!0-9a-f]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+have_gitleaks=no
+if command -v gitleaks >/dev/null 2>&1; then
+  have_gitleaks=yes
+else
+  echo "pre-push: warning: gitleaks is not installed, so the outgoing commits were not scanned for secrets." >&2
+fi
+
+# check_commits <rev-list arguments...>: the path and message checks for each
+# outgoing commit.
+check_commits() {
+  if ! git rev-list "$@" >"$tmp/commits" </dev/null; then
+    refuse "could not list the outgoing commits."
+    return
+  fi
+  while read -r commit; do
+    if ! git diff-tree -r -m --root --no-commit-id --name-only --no-renames \
+      --diff-filter=d -z "$commit" >"$tmp/paths" </dev/null; then
+      refuse "could not list the files in commit $commit."
+      continue
+    fi
+    if ! bad=$(tr '\000' '\n' <"$tmp/paths" | awk -f "$hooks_dir/never-commit.awk"); then
+      refuse "could not check the files in commit $commit."
+      continue
+    fi
+    if [ -n "$bad" ]; then
+      refuse "commit $commit adds paths that must never be committed:"
+      printf '%s\n' "$bad" | sed 's/^/    /' >&2
+    fi
+    if ! git -c log.showSignature=false log -1 --format=%B "$commit" >"$tmp/message" </dev/null; then
+      refuse "could not read the message of commit $commit."
+      continue
+    fi
+    if ! sh "$hooks_dir/commit-msg" "$tmp/message" </dev/null; then
+      refuse "commit $commit: its message was refused (see above)."
+    fi
+  done <"$tmp/commits"
+}
+
+# check_main <sha>: the signatures on main after the baseline.
+check_main() {
+  if [ ! -f "$baseline_file" ]; then
+    refuse ".githooks/signed-baseline is missing. Restore it: empty until signing works, then the baseline commit."
+    return
+  fi
+  base=$(sed 's/#.*//' "$baseline_file" | tr -d ' \t\r\n' | tr 'A-F' 'a-f')
+  if [ -z "$base" ]; then
+    echo "pre-push: warning: .githooks/signed-baseline is empty, so signatures on main are not checked yet. Set it once signing works (PLAN section 10)." >&2
+    return
+  fi
+  if ! is_hex "$base" || { [ ${#base} -ne 40 ] && [ ${#base} -ne 64 ]; }; then
+    refuse ".githooks/signed-baseline must hold one full commit hash."
+    return
+  fi
+  if ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+    refuse "the baseline commit $base is not in this repository. Fetch it first."
+    return
+  fi
+  if ! git merge-base --is-ancestor "$base" "$1" </dev/null; then
+    refuse "the main being pushed does not contain the baseline commit $base."
+    return
+  fi
+  if ! git -c log.showSignature=false log --first-parent --format='%G? %h %s' \
+    "$base..$1" >"$tmp/signatures" 2>/dev/null </dev/null; then
+    refuse "could not read the signatures on main."
+    return
+  fi
+  unsigned=$(grep -v '^G ' "$tmp/signatures")
+  if [ -n "$unsigned" ]; then
+    refuse "every first-parent commit on main after the baseline needs a good signature (%G? = G). These don't have one:"
+    printf '%s\n' "$unsigned" | sed 's/^/    /' >&2
+    if [ -z "$(git config --get gpg.ssh.allowedSignersFile)" ]; then
+      echo "    (gpg.ssh.allowedSignersFile is not set, so git cannot check SSH signatures.)" >&2
+    fi
+  fi
+}
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  if ! is_hex "${local_sha-}" || ! is_hex "${remote_sha-}"; then
+    refuse "unexpected input from git: $local_ref ${local_sha-} ${remote_ref-} ${remote_sha-}"
+    continue
+  fi
+  is_main=no
+  case $remote_ref in
+    refs/heads/[Mm][Aa][Ii][Nn]) is_main=yes ;;
+  esac
+
+  if is_zero "$local_sha"; then
+    if [ "$is_main" = yes ]; then
+      refuse "deleting main is not allowed."
+    fi
+    continue
+  fi
+
+  # The outgoing commits: those after the remote's commit when it is known here,
+  # otherwise those that no remote-tracking branch has.
+  if ! is_zero "$remote_sha" && git cat-file -e "$remote_sha^{commit}" 2>/dev/null; then
+    check_commits "$remote_sha..$local_sha"
+    log_opts="$remote_sha..$local_sha"
+  else
+    check_commits "$local_sha" --not --remotes
+    log_opts="$local_sha --not --remotes"
+  fi
+
+  if [ "$have_gitleaks" = yes ]; then
+    if ! gitleaks git --log-opts="$log_opts" --redact --no-banner --verbose </dev/null; then
+      refuse "gitleaks reported a possible secret in the commits for $remote_ref, or could not run."
+    fi
+  fi
+
+  if [ "$is_main" = yes ]; then
+    check_main "$local_sha"
+  fi
+done
+
+exit $status
